@@ -1,0 +1,19 @@
+MODULE DDEUtils; (* SvdW, 8 May 1995 *)
+
+(* SWI's and Reason codes *)
+
+  CONST
+    Prefix*         = 42580H;
+    SetCLSize*      = 42581H;
+    SetCL*          = 42582H;
+    GetCLSize*      = 42583H;
+    GetCL*          = 42584H;
+    ThrowbackStart* = 42587H;
+    ThrowbackSend*  = 42588H;
+    ThrowbackEnd*   = 42589H;
+    
+    ThrowbackReasonProcessing*   = 0;
+    ThrowbackReasonErrorDetails* = 1;
+    ThrowbackReasonInfoDetails*  = 2;
+
+END DDEUtils.

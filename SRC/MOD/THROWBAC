@@ -1,0 +1,58 @@
+MODULE Throwback; (* SvdW, 8 May 1995 *)
+
+(* Throw errors to an error-catching editor *)
+
+  IMPORT SYSTEM, CLib, DDEUtils;
+
+  CONST
+    Warning* = 0;
+    Error*   = 1;
+    SeriousError* = 2;
+
+  VAR
+    noerrors: BOOLEAN;
+    started : BOOLEAN;
+
+  PROCEDURE Start*();
+    VAR regs: CLib.SwiRegs;
+  BEGIN
+    noerrors := TRUE;
+    started  := FALSE;
+  END Start;
+
+  PROCEDURE SendError*(FName: ARRAY OF CHAR;lineno, severety: LONGINT; Desc: ARRAY OF CHAR);
+    VAR i: LONGINT; regs: CLib.SwiRegs;
+  BEGIN
+
+    IF noerrors THEN
+      noerrors := FALSE;
+      started  := CLib.KernelSwi(DDEUtils.ThrowbackStart, SYSTEM.ADR(regs), SYSTEM.ADR(regs)) = 0;
+      IF started THEN
+        regs.r[0] := DDEUtils.ThrowbackReasonProcessing;
+        regs.r[2] := SYSTEM.ADR(FName[0]);
+        i := CLib.KernelSwi(DDEUtils.ThrowbackSend, SYSTEM.ADR(regs.r[0]), SYSTEM.ADR(regs.r[0]));
+      END;
+    END;
+
+    IF started THEN
+      regs.r[0] := DDEUtils.ThrowbackReasonErrorDetails;
+      regs.r[2] := SYSTEM.ADR(FName[0]);
+      regs.r[3] := lineno;
+      regs.r[4] := severety;
+      regs.r[5] := SYSTEM.ADR(Desc[0]);
+      i := CLib.KernelSwi(DDEUtils.ThrowbackSend, SYSTEM.ADR(regs.r[0]), SYSTEM.ADR(regs.r[0]));
+    END;
+  END SendError;
+
+  PROCEDURE End*();
+    VAR i: LONGINT; regs: CLib.SwiRegs;
+  BEGIN
+      noerrors := TRUE;
+      started  := FALSE;
+      i := CLib.KernelSwi(DDEUtils.ThrowbackEnd, SYSTEM.ADR(regs.r[0]), SYSTEM.ADR(regs.r[0]));      
+  END End;
+
+BEGIN (* Throwback *)
+  noerrors := TRUE;
+  started := FALSE;
+END Throwback.

@@ -1,0 +1,564 @@
+MODULE COCS;  (*NW 7.6.87 / 20.12.90*) (* DVD 05 08 1993 01:05 *)
+  
+    IMPORT Files, Reals, Texts, Throwback;
+  
+    (*symbols:
+        |  0          1          2           3            4
+     ---|--------------------------------------------------------
+      0 |  null       *          /           DIV          MOD
+      5 |  &          +          -           OR           =
+     10 |  #          <          <=          >            >=
+     15 |  IN         IS         ^           .            ,
+     20 |  :          ..         )           ]            }
+     25 |  OF         THEN       DO          TO           (
+     30 |  [          {          ~           :=           number
+     35 |  NIL        string     ident       ;            |
+     40 |  END        ELSE       ELSIF       UNTIL        IF
+     45 |  CASE       WHILE      REPEAT      LOOP         WITH      
+     50 |  EXIT       RETURN     ARRAY       RECORD       POINTER
+     55 |  BEGIN      CONST      TYPE        VAR          PROCEDURE
+     60 |  IMPORT     MODULE     eof *)
+  
+    CONST KW = 43;  (*size of hash table*)
+          maxDig = 32;
+          maxInt = 7FFFH;
+          maxShInt = 7FH;
+          maxExp = 38; maxLExp = 308;
+          maxStrLen = 127;
+      
+    (*name, numtyp, intval, realval, lrlval are implicit results of Get*)
+  
+    TYPE
+      errormsg = ARRAY 132 OF CHAR;
+
+    VAR
+      linecol*: BOOLEAN;
+
+      numtyp* : INTEGER; (* 1 = char, 2 = integer, 3 = real, 4 = longreal*)
+      intval* : LONGINT;
+      realval*: REAL;
+      lrlval* : LONGREAL;
+      scanerr*: BOOLEAN;
+      name*   : ARRAY maxStrLen + 1 OF CHAR;
+
+      txtpos*: RECORD
+        name*: ARRAY Files.MaxPathLength + 1 OF CHAR;
+        line*: LONGINT;
+        col*: INTEGER
+      END;
+  
+      ifile: Files.File;
+      Input: Files.Rider;
+      Diag: Texts.Writer;
+  
+      ch: CHAR;     (*current character*)
+      lastpos: LONGINT; (*error position in source file*)
+
+      i: INTEGER;
+      keyTab  : ARRAY KW OF RECORD 
+        symb, alt: INTEGER; 
+        id: ARRAY 12 OF CHAR 
+      END;
+
+      errormsgs: ARRAY 250 OF errormsg;
+
+    PROCEDURE Mark*(n: INTEGER);
+      VAR pos:  LONGINT;
+    BEGIN 
+      pos := Files.Pos(Input);
+      IF lastpos + 8 < pos THEN
+        Texts.WriteLn(Diag); 
+        IF linecol THEN
+          Texts.WriteString(Diag, txtpos.name); 
+          Texts.WriteString(Diag, "("); Texts.WriteInt(Diag, txtpos.line, 1);
+          Texts.WriteString(Diag, ", "); Texts.WriteInt(Diag, txtpos.col, 1);
+          Texts.WriteString(Diag, "): ")
+        ELSE
+          Texts.WriteString(Diag, "  pos"); Texts.WriteInt(Diag, pos, 8)
+        END;
+        IF n < 0 THEN Texts.WriteString(Diag, "  warning");
+          IF linecol THEN
+            Throwback.SendError(txtpos.name, txtpos.line, Throwback.Warning, errormsgs[-n]);
+          END;
+        ELSE Texts.WriteString(Diag, "  err"); scanerr := TRUE;
+          IF linecol THEN
+            Throwback.SendError(txtpos.name, txtpos.line, Throwback.Error, errormsgs[n]);
+          END;
+        END ;
+        Texts.WriteInt(Diag, ABS(n), 4); 
+        Texts.WriteString(Diag, " ");
+        Texts.WriteString(Diag, errormsgs[ABS(n)]);
+        Texts.WriteString(Diag, " ");
+        Texts.Append(Files.StdErr, Diag.buf);
+        lastpos := pos
+      END
+    END Mark;
+
+    PROCEDURE Read(VAR ch: CHAR);
+    BEGIN Files.Read(Input, ch);
+      IF ch = 0AX THEN 
+        INC(txtpos.line); txtpos.col := 0 
+      ELSE 
+        INC(txtpos.col) 
+      END
+    END Read;
+  
+    PROCEDURE String(VAR sym: INTEGER);
+      VAR i: INTEGER;
+    BEGIN i := 0;
+      LOOP Read(ch);
+        IF ch = 22X THEN EXIT END ;
+        IF ch < " " THEN Mark(3); EXIT END ;
+        IF i < maxStrLen THEN name[i] := ch; INC(i) ELSE Mark(212); i := 0 END
+      END ;
+      Read(ch);
+      IF i = 1 THEN sym := 34; numtyp := 1; intval := ORD(name[0]) (*character*)
+      ELSE sym := 36; intval := i; name[i] := 0X (*string,intval holds length*)
+      END
+    END String;
+  
+    PROCEDURE Identifier(VAR sym: INTEGER);
+      VAR i, k: INTEGER;
+    BEGIN i := 0; k := 0;
+      REPEAT
+        IF i < 31 THEN name[i] := ch; INC(i); INC(k, ORD(ch)) END ;
+        Read(ch)
+      UNTIL (ch < "0") OR ("9" < ch) & (CAP(ch) < "A") OR ("Z" < CAP(ch));
+      name[i] := 0X;
+      k := (k+i) MOD KW;  (*hash function*)
+      IF (keyTab[k].symb # 0) & (keyTab[k].id = name) THEN sym := keyTab[k].symb
+      ELSE k := keyTab[k].alt;
+        IF (keyTab[k].symb # 0) & (keyTab[k].id = name) THEN sym := keyTab[k].symb
+        ELSE sym := 37 (*ident*)
+        END
+      END
+    END Identifier;
+  
+    PROCEDURE Hval(ch: CHAR): INTEGER;
+      VAR d: INTEGER;
+    BEGIN d := ORD(ch) - 30H; (*d >= 0*)
+      IF d >= 10 THEN
+        IF (d >= 17) & (d < 23) THEN DEC(d, 7) ELSE d := 0; Mark(2) END
+      END ;
+      RETURN d
+    END Hval;
+  
+    PROCEDURE Number;
+      VAR i, j, h, d, e, n: INTEGER;
+      x, f:   REAL;
+      y, g: LONGREAL;
+      lastCh: CHAR; neg: BOOLEAN;
+      dig:    ARRAY maxDig OF CHAR;
+  
+      PROCEDURE ReadScaleFactor;
+      BEGIN Read(ch);
+        IF ch = "-" THEN neg := TRUE; Read(ch)
+        ELSE neg := FALSE;
+          IF ch = "+" THEN Read(ch) END
+        END ;
+        IF ("0" <= ch) & (ch <= "9") THEN
+          REPEAT e := e*10 + ORD(ch)-30H; Read(ch)
+          UNTIL (ch < "0") OR (ch >"9")
+        ELSE Mark(2)
+        END
+      END ReadScaleFactor;
+  
+    BEGIN i := 0;
+      REPEAT dig[i] := ch; INC(i); Read(ch)
+      UNTIL (ch < "0") OR ("9" < ch) & (CAP(ch) < "A") OR ("Z" < CAP(ch));
+      lastCh := ch; j := 0;
+      WHILE (j < i-1) & (dig[j] = "0") DO INC(j) END;
+      IF (dig[j] = "H") OR (dig[j] = "X") THEN DEC(j) END;
+      IF ch = "." THEN Read(ch);
+        IF ch = "." THEN lastCh := 0X; ch := 7FX END
+      END ;
+      IF lastCh = "." THEN (*decimal point*)
+        h := i;
+        WHILE ("0" <= ch) & (ch <= "9") DO (*read fraction*)
+          IF i < maxDig THEN dig[i] := ch; INC(i) END ;
+          Read(ch)
+        END ;
+        IF ch = "D" THEN
+          y := 0; g := 1; e := 0;
+          WHILE j < h DO y := y*10 + (ORD(dig[j])-30H); INC(j) END ;
+          WHILE j < i DO g := g/10; y := (ORD(dig[j])-30H)*g + y; INC(j) END ;
+          ReadScaleFactor;
+          IF neg THEN
+            IF e <= maxLExp THEN y := y / Reals.TenL(e) ELSE y := 0 END
+          ELSIF e > 0 THEN
+            IF e <= maxLExp THEN y := Reals.TenL(e) * y ELSE y := 0; Mark(203) END
+          END ;
+          numtyp := 4; lrlval := y
+        ELSE x := 0; f := 1; e := 0;
+          WHILE j < h DO x := x*10 + (ORD(dig[j])-30H); INC(j) END ;
+          WHILE j < i DO f := f/10; x := (ORD(dig[j])-30H)*f + x; INC(j) END ;
+          IF ch = "E" THEN ReadScaleFactor END ;
+          IF neg THEN
+            IF e <= maxExp THEN x := x / Reals.Ten(e) ELSE x := 0 END
+          ELSIF e > 0 THEN
+            IF e <= maxExp THEN x := Reals.Ten(e) * x ELSE x := 0; Mark(203) END
+          END ;
+          numtyp := 3; realval := x
+        END
+      ELSE (*integer*)
+        lastCh := dig[i-1]; intval := 0;
+        IF lastCh = "H" THEN
+          IF j < i THEN
+            DEC(i); intval := Hval(dig[j]); INC(j);
+            IF i-j <= 7 THEN
+              IF (i-j = 7) & (intval >= 8) THEN DEC(intval, 16) END ;
+              WHILE j < i DO intval := Hval(dig[j]) + intval * 10H; INC(j) END
+            ELSE Mark(203)
+            END
+          END
+        ELSIF lastCh = "X" THEN
+          DEC(i);
+          WHILE j < i DO
+            intval := Hval(dig[j]) + intval*10H; INC(j);
+            IF intval > 0FFH THEN Mark(203); intval := 0 END
+          END
+        ELSE (*decimal*)
+          WHILE j < i DO
+            d := ORD(dig[j]) - 30H;
+            IF d < 10 THEN
+              IF intval <= (MAX(LONGINT) - d) DIV 10 THEN intval := intval*10 + d
+              ELSE Mark(203); intval := 0
+              END
+            ELSE Mark(2); intval := 0
+            END ;
+            INC(j)
+          END
+        END ;
+        IF lastCh = "X" THEN numtyp := 1 ELSE numtyp := 2 END
+      END
+    END Number;
+  
+    PROCEDURE Get*(VAR sym: INTEGER);
+      VAR s: INTEGER; xch: CHAR;
+  
+      PROCEDURE Comment;  (* do not read after end of file *)
+      BEGIN Read(ch);
+        LOOP
+          LOOP
+            WHILE ch = "(" DO Read(ch);
+              IF ch = "*" THEN Comment END
+            END ;
+            IF ch = "*" THEN Read(ch); EXIT END ;
+            IF ch = 0X THEN EXIT END ;
+            Read(ch)
+          END ;
+          IF ch = ")" THEN Read(ch); EXIT END ;
+          IF ch = 0X THEN Mark(5); EXIT END
+        END
+      END Comment;
+  
+    BEGIN
+      LOOP (*ignore control characters*)
+        IF ch <= " " THEN
+          IF ch = 0X THEN ch := " "; EXIT
+          ELSE Read(ch)
+          END
+        ELSIF ch > 7FX THEN Read(ch)
+        ELSE EXIT
+        END
+      END ;
+      CASE ch OF   (* " " <= ch <= 7FX *)
+          " "  : s := 62; ch := 0X (*eof*)
+        | "!", "$", "%", "'", "?", "@", "\", "_", "`": s :=  0; Read(ch)
+        | 22X  : String(s)
+        | "#"  : s := 10; Read(ch)
+        | "&"  : s :=  5; Read(ch)
+        | "("  : Read(ch);
+                 IF ch = "*" THEN Comment; Get(s)
+                   ELSE s := 29
+                 END
+        | ")"  : s := 22; Read(ch)
+        | "*"  : s :=  1; Read(ch)
+        | "+"  : s :=  6; Read(ch)
+        | ","  : s := 19; Read(ch)
+        | "-"  : s :=  7; Read(ch)
+        | "."  : Read(ch);
+                 IF ch = "." THEN Read(ch); s := 21 ELSE s := 18 END
+        | "/"  : s := 2;  Read(ch)
+        | "0".."9": Number; s := 34
+        | ":"  : Read(ch);
+                 IF ch = "=" THEN Read(ch); s := 33 ELSE s := 20 END
+        | ";"  : s := 38; Read(ch)
+        | "<"  : Read(ch);
+                 IF ch = "=" THEN Read(ch); s := 12 ELSE s := 11 END
+        | "="  : s :=  9; Read(ch)
+        | ">"  : Read(ch);
+                 IF ch = "=" THEN Read(ch); s := 14 ELSE s := 13 END
+        | "A".."Z": Identifier(s)
+        | "["  : s := 30; Read(ch)
+        | "]"  : s := 23; Read(ch)
+        | "^"  : s := 17; Read(ch)
+        | "a".."z": Identifier(s)
+        | "{"  : s := 31; Read(ch)
+        | "|"  : s := 39; Read(ch)
+        | "}"  : s := 24; Read(ch)
+        | "~"  : s := 32; Read(ch)
+        | 7FX  : s := 21; Read(ch)
+      END ;
+      sym := s
+    END Get;
+  
+    PROCEDURE Open*(name: ARRAY OF CHAR);
+    BEGIN
+      COPY(name, txtpos.name);
+      ch := " "; scanerr := FALSE; 
+      lastpos := -8; 
+      txtpos.line := 1; txtpos.col := 0;
+      ifile := Files.Old(name);
+      Files.Set(Input, ifile, 0)
+    END Open;
+
+    PROCEDURE Close*;
+    BEGIN Files.Close(ifile);
+      IF scanerr THEN Texts.WriteLn(Diag) END;
+      Texts.Append(Files.StdErr, Diag.buf)
+    END Close;
+  
+    PROCEDURE EnterKW(sym: INTEGER; name: ARRAY OF CHAR);
+      VAR j, k: INTEGER;
+    BEGIN j := 0; k := 0;
+      REPEAT INC(k, ORD(name[j])); INC(j)
+      UNTIL name[j] = 0X;
+      k := (k+j) MOD KW;  (*hash function*)
+      IF keyTab[k].symb # 0 THEN
+        j := k;
+        REPEAT INC(k) UNTIL keyTab[k].symb = 0;
+        keyTab[j].alt := k
+      END ;
+      keyTab[k].symb := sym; COPY(name, keyTab[k].id)
+    END EnterKW;
+  
+  BEGIN linecol := FALSE;
+    i := KW;
+    WHILE i > 0 DO
+      DEC(i); keyTab[i].symb := 0; keyTab[i].alt := 0
+    END ;
+    keyTab[0].id := "";
+    EnterKW(27, "DO");
+    EnterKW(44, "IF");
+    EnterKW(15, "IN");
+    EnterKW(16, "IS");
+    EnterKW(25, "OF");
+    EnterKW( 8, "OR");
+    EnterKW(40, "END");
+    EnterKW( 4, "MOD");
+    EnterKW(35, "NIL");
+    EnterKW(58, "VAR");
+    EnterKW(45, "CASE");
+    EnterKW(41, "ELSE");
+    EnterKW(50, "EXIT");
+    EnterKW(26, "THEN");
+    EnterKW(49, "WITH");
+    EnterKW(52, "ARRAY");
+    EnterKW(55, "BEGIN");
+    EnterKW(56, "CONST");
+    EnterKW(42, "ELSIF");
+    EnterKW(43, "UNTIL");
+    EnterKW(46, "WHILE");
+    EnterKW(53, "RECORD");
+    EnterKW(47, "REPEAT");
+    EnterKW(51, "RETURN");
+    EnterKW(59, "PROCEDURE");
+    EnterKW(28, "TO");
+    EnterKW( 3, "DIV");
+    EnterKW(48, "LOOP");
+    EnterKW(57, "TYPE");
+    EnterKW(60, "IMPORT");
+    EnterKW(61, "MODULE");
+    EnterKW(54, "POINTER");
+
+
+ (* List of Oberon Error Numbers                      *)
+ (* N. Wirth / 20.6.87 / David Tolpin Wed Jan 26 1994 *)
+ (* 1. Incorrect use of language Oberon               *)
+
+    errormsgs[ 0] := "undeclared identifier";
+    errormsgs[ 1] := "multiply defined identifier";
+    errormsgs[ 2] := "illegal character in number";
+    errormsgs[ 3] := "illegal character in string";
+    errormsgs[ 4] := "identifier does not match procedure name";
+    errormsgs[ 5] := "comment not closed";
+    errormsgs[ 6] := "";
+    errormsgs[ 7] := "";
+    errormsgs[ 8] := "";
+    errormsgs[ 9] := "'=' expected";
+    errormsgs[10] := "identifier expected";
+    errormsgs[11] := "";
+    errormsgs[12] := "type definition starts with incorrect symbol";
+    errormsgs[13] := "factor starts with incorrect symbol";
+    errormsgs[14] := "statement starts with incorrect symbol";
+    errormsgs[15] := "declaration followed by incorrect symbol";
+    errormsgs[16] := "MODULE expected";
+    errormsgs[17] := "number expected";
+    errormsgs[18] := "'.' missing";
+    errormsgs[19] := "',' missing";
+    errormsgs[20] := "':' missing";
+    errormsgs[21] := "";
+    errormsgs[22] := "')' missing";
+    errormsgs[23] := "']' missing";
+    errormsgs[24] := "'}' missing";
+    errormsgs[25] := "OF missing";
+    errormsgs[26] := "THEN missing";
+    errormsgs[27] := "DO missing";
+    errormsgs[28] := "TO missing";
+    errormsgs[29] := "'(' missing";
+    errormsgs[30] := "";
+    errormsgs[31] := "";
+    errormsgs[32] := "";
+    errormsgs[33] := "':=' missing";
+    errormsgs[34] := "',' or OF expected";
+    errormsgs[35] := "";
+    errormsgs[36] := "";
+    errormsgs[37] := "identifier expected";
+    errormsgs[38] := "';' missing";
+    errormsgs[39] := "";
+    errormsgs[40] := "END missing";
+    errormsgs[41] := "";
+    errormsgs[42] := "";
+    errormsgs[43] := "UNTIL missing";
+    errormsgs[44] := "";
+    errormsgs[45] := "EXIT not within loop statement";
+    errormsgs[46] := "";
+    errormsgs[47] := "illegally marked identifier";
+    errormsgs[48] := "unsatisfied forward reference";
+    errormsgs[49] := "recursive import not allowed";
+    errormsgs[50] := "expression should be constant";
+    errormsgs[51] := "constant not an integer";
+    errormsgs[52] := "identifier does not denote a type";
+    errormsgs[53] := "identifier does not denote a record type";
+    errormsgs[54] := "result type of procedure is not a basic type";
+    errormsgs[55] := "procedure call of a function";
+    errormsgs[56] := "assignment to non-variable";
+    errormsgs[57] := "pointer not bound to record or array type";
+    errormsgs[58] := "recursive type definition";
+    errormsgs[59] := "illegal open array parameter";
+    errormsgs[60] := "wrong type of case label";
+    errormsgs[61] := "inadmissible type of case label";
+    errormsgs[62] := "case label defined more than once";
+    errormsgs[63] := "index out of bounds";
+    errormsgs[64] := "more actual than formal parameters";
+    errormsgs[65] := "fewer actual than formal parameters";
+    errormsgs[66] := "element types of actual array and formal open array differ";
+    errormsgs[67] := "actual parameter corresponding to open array is not an array";
+    errormsgs[68] := "";
+    errormsgs[69] := "parameter must be an integer constant";
+    errormsgs[70] := "";
+    errormsgs[71] := "";
+    errormsgs[72] := "";
+    errormsgs[73] := "procedure must have level 0";
+    errormsgs[74] := "";
+    errormsgs[75] := "";
+    errormsgs[76] := "";
+    errormsgs[77] := "object is not a record";
+    errormsgs[78] := "dereferenced object is not a variable";
+    errormsgs[79] := "indexed object is not a variable";
+    errormsgs[80] := "index expression is not an integer";
+    errormsgs[81] := "index out of specified bounds";
+    errormsgs[82] := "indexed variable is not an array";
+    errormsgs[83] := "undefined record field";
+    errormsgs[84] := "dereferenced variable is not a pointer";
+    errormsgs[85] := "guard or test type is not an extension of variable type";
+    errormsgs[86] := "guard or testtype is not a pointer";
+    errormsgs[87] := "guarded or tested variable is neither a pointer nor a VAR-parameter record";
+    errormsgs[88] := "";
+    errormsgs[89] := "";
+    errormsgs[90] := "";
+    errormsgs[91] := "";
+    errormsgs[92] := "operand of IN not an integer, or not a set";
+    errormsgs[93] := "set element type is not an integer";
+    errormsgs[94] := "operand of & is not of type BOOLEAN";
+    errormsgs[95] := "operand of OR is not of type BOOLEAN";
+    errormsgs[96] := "operand not applicable to (unary) +";
+    errormsgs[97] := "operand not applicable to (unary) -";
+    errormsgs[98] := "operand of ~ is not of type BOOLEAN";
+    errormsgs[99] := "";
+    errormsgs[100] := "incompatible operands of dyadic operator";
+    errormsgs[101] := "operand type inapplicable to *";
+    errormsgs[102] := "operand type inapplicable to /";
+    errormsgs[103] := "operand type inapplicable to DIV";
+    errormsgs[104] := "operand type inapplicable to MOD";
+    errormsgs[105] := "operand type inapplicable to +";
+    errormsgs[106] := "operand type inapplicable to -";
+    errormsgs[107] := "operand type inapplicable to = or #";
+    errormsgs[108] := "operand type inapplicable to relation";
+    errormsgs[109] := "";
+    errormsgs[110] := "operand is not a type";
+    errormsgs[111] := "operand inapplicable to (this) function";
+    errormsgs[112] := "operand is not a variable";
+    errormsgs[113] := "incompatible assignment";
+    errormsgs[114] := "string too long";
+    errormsgs[115] := "parameter discrepancy between type (or name) of variable (or forward procedure) and this procedure";
+    errormsgs[116] := "type of variable (or forward procedure) has more parameters than this procedure";
+    errormsgs[117] := "type of variable (or forward procedure) has fewer parameters than this procedure";
+    errormsgs[118] := "procedure result type of variable (or of forward declaration) differs from result type of this procedure";
+    errormsgs[119] := "assigned procedure is not global";
+    errormsgs[120] := "type of expression following IF, WHILE, or UNTIL is not BOOLEAN";
+    errormsgs[121] := "called object is not a procedure (or is an interrupt procedure)";
+    errormsgs[122] := "actual VAR-parameter is not a variable";
+    errormsgs[123] := "type of actual parameter is not identical with that of formal VAR-parameter";
+    errormsgs[124] := "type of result expression differs from that of procedure";
+    errormsgs[125] := "type of case expression is neither INTEGER nor CHAR";
+    errormsgs[126] := "this expression cannot be a type or a procedure";
+    errormsgs[127] := "illegal use of object";
+    errormsgs[128] := "";
+    errormsgs[129] := "unsatisfied forward procedure";
+    errormsgs[130] := "WITH clause does not specify a variable";
+    errormsgs[131] := "LEN not applied to array";
+    errormsgs[132] := "dimension in LEN too large or negative";
+    errormsgs[133] := "procedure declaration don't match forward declaration";
+    errormsgs[150] := "key inconsistency of imported module";
+    errormsgs[151] := "incorrect symbol file";
+    errormsgs[152] := "symbol file of imported module not found";
+    errormsgs[153] := "object or symbol file not opened (disk full?)";
+    errormsgs[154] := "";
+    errormsgs[155] := "generation of new symbol file not allowed";
+    errormsgs[156] := "generation of new h-file is not allowed";
+
+ (* 2. Limitations of implementation  *)
+
+    errormsgs[200] := "not yet implemented";
+    errormsgs[201] := "lower bound of set range greater than higher bound";
+    errormsgs[202] := "set element greater  than MAX(SET) or less than 0";
+    errormsgs[203] := "number too large";
+    errormsgs[204] := "product too large";
+    errormsgs[205] := "division by zero";
+    errormsgs[206] := "sum too large";
+    errormsgs[207] := "difference too large";
+    errormsgs[208] := "overflow in arithmetic shift";
+    errormsgs[209] := "";
+    errormsgs[210] := "";
+    errormsgs[211] := "";
+    errormsgs[212] := "";
+    errormsgs[213] := "";
+    errormsgs[214] := "";
+    errormsgs[215] := "not enough registers: simplify expression";
+    errormsgs[216] := "";
+    errormsgs[217] := "parameter must be an integer constant";
+    errormsgs[218] := "illegal value of parameter  (32 <= p < 256)";
+    errormsgs[219] := "illegal value of parameter  (0 <= p < 16)";
+    errormsgs[220] := "illegal value of parameter";
+    errormsgs[221] := "imported string is not a constant";
+    errormsgs[222] := "";
+    errormsgs[223] := "too many record types";
+    errormsgs[224] := "too many pointer types";
+    errormsgs[225] := "";
+    errormsgs[226] := "";
+    errormsgs[227] := "too many imported modules";
+    errormsgs[228] := "too many exported structures";
+    errormsgs[229] := "too many nested records for import";
+    errormsgs[230] := "too many constants (strings) in module";
+    errormsgs[231] := "";
+    errormsgs[232] := "";
+    errormsgs[233] := "record extension hierarchy too high";
+    errormsgs[234] := "";
+    errormsgs[240] := "identifier too long";
+    errormsgs[241] := "string too long";
+    errormsgs[244] := "character array too long";
+
+    Texts.OpenWriter(Diag);
+END COCS.

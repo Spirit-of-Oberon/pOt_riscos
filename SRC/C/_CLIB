@@ -1,0 +1,11 @@
+#include <kernel.h>
+
+/* SvdW  8 May 1995 */
+
+/* Implement CLib.KernelSwi */
+
+extern int KernelSwi(int swino, int in, int out)
+{
+  return (int)_kernel_swi(swino, (_kernel_swi_regs*)in, (_kernel_swi_regs*)out);
+}
+

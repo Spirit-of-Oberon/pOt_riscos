@@ -1,0 +1,13 @@
+MODULE CLib; (* SvdW, 8 May 1995 *)
+
+(* Interface to _kernel_swi in the Shared C Library *)
+
+
+TYPE SwiRegs* = RECORD
+    r*: ARRAY 10 OF LONGINT;
+  END;
+
+(* Call _kernel_swi via c._Clib *)
+PROCEDURE -KernelSwi*(swino: LONGINT; in: LONGINT; out: LONGINT): LONGINT 0;
+
+END CLib.
