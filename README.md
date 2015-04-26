@@ -57,7 +57,7 @@ Note
 
 Contacting me
 
-  email: svdwal@xs4all.nl
+  email: svdwal ¤ xs4all · nl
   snail mail: Sander van der Wal
               Bevrijdingsplein 39
               2321 BX Leiden
